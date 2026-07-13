@@ -21,6 +21,7 @@ const elements = {
   viewSelect: document.getElementById("viewSelect"),
   demoBtn: document.getElementById("demoBtn"),
   chartTooltip: document.getElementById("chartTooltip"),
+  presetButtons: Array.from(document.querySelectorAll(".preset-btn")),
 };
 
 const demoDataset = {
@@ -253,7 +254,7 @@ function getPreferredMetric(summary) {
   return preferred || summary.numericColumns[0];
 }
 
-function fillSelectors(dataset) {
+function fillSelectors(dataset, preserveExistingSelections = false) {
   const summary = getColumnSummary(dataset);
   const preferredMetric = getPreferredMetric(summary);
   const preferredDimension = summary.categoricalColumns[0] || { header: "Row Index" };
@@ -263,15 +264,51 @@ function fillSelectors(dataset) {
     .map((column) => `<option value="${escapeHtml(column.header)}">${escapeHtml(column.header)}</option>`)
     .join("");
 
+  const currentMetricValue = elements.metricSelect.value;
+  const currentDimensionValue = elements.dimensionSelect.value;
+
   elements.metricSelect.innerHTML = numericOptions || '<option value="">No numeric field</option>';
   elements.dimensionSelect.innerHTML = dimensionOptions || '<option value="">No category field</option>';
 
-  if (preferredMetric) {
+  const metricStillExists = Array.from(elements.metricSelect.options).some((option) => option.value === currentMetricValue);
+  const dimensionStillExists = Array.from(elements.dimensionSelect.options).some((option) => option.value === currentDimensionValue);
+
+  if (preserveExistingSelections && metricStillExists) {
+    elements.metricSelect.value = currentMetricValue;
+  } else if (preferredMetric) {
     elements.metricSelect.value = preferredMetric.header;
   }
-  if (preferredDimension) {
+
+  if (preserveExistingSelections && dimensionStillExists) {
+    elements.dimensionSelect.value = currentDimensionValue;
+  } else if (preferredDimension) {
     elements.dimensionSelect.value = preferredDimension.header;
   }
+}
+
+function applyPreset(presetName) {
+  const summary = getColumnSummary(state);
+  if (!summary.numericColumns.length) return;
+
+  const spendMetric = summary.numericColumns.find((column) => /觀光支出|revenue|sales|amount|spend|cost/i.test(column.header)) || summary.numericColumns[0];
+  const valueMetric = spendMetric || summary.numericColumns[0];
+
+  elements.metricSelect.value = valueMetric.header;
+  elements.dimensionSelect.value = "Year";
+
+  if (presetName === "market") {
+    elements.viewSelect.value = "bar";
+    elements.aiResponse.textContent = `Preset analysis: source market comparison using ${valueMetric.header}.`;
+  } else if (presetName === "growth") {
+    elements.viewSelect.value = "line";
+    elements.aiResponse.textContent = `Preset analysis: growth and recovery trend using ${valueMetric.header}.`;
+  } else {
+    elements.viewSelect.value = "line";
+    elements.aiResponse.textContent = `Preset analysis: ${presetName === "peak" ? "peak year" : "lowest year"} for ${valueMetric.header}.`;
+  }
+
+  renderDashboard(state);
+  renderInsights(state);
 }
 
 function average(values) {
@@ -635,6 +672,66 @@ function renderInsights(dataset) {
   elements.insightsList.innerHTML = insights.map((item) => `<li>${escapeHtml(item)}</li>`).join("");
 }
 
+function findMetricColumnByPrompt(dataset, prompt, fallbackMetricHeader) {
+  const summary = getColumnSummary(dataset);
+  const lowerPrompt = prompt.toLowerCase();
+
+  const headerMatch = summary.numericColumns.find((column) => lowerPrompt.includes(column.header.toLowerCase()));
+  if (headerMatch) return headerMatch;
+
+  const keywordMatch = summary.numericColumns.find((column) => {
+    const header = column.header.toLowerCase();
+    const spendKeywords = /(支出|消費|花費|費用|revenue|sales|expense|spend|cost|amount)/i;
+    const stayKeywords = /(停留|夜數|night|stay)/i;
+    const visitorKeywords = /(旅客|visitor|arrival|旅遊)/i;
+
+    if (spendKeywords.test(header) && spendKeywords.test(lowerPrompt)) return true;
+    if (stayKeywords.test(header) && stayKeywords.test(lowerPrompt)) return true;
+    if (visitorKeywords.test(header) && visitorKeywords.test(lowerPrompt)) return true;
+    return false;
+  });
+
+  if (keywordMatch) return keywordMatch;
+  return summary.numericColumns.find((column) => column.header === fallbackMetricHeader) || getPreferredMetric(summary);
+}
+
+function getTimeColumnForPrompt(dataset, prompt, fallbackHeader) {
+  const summary = getColumnSummary(dataset);
+  const lowerPrompt = prompt.toLowerCase();
+
+  const explicitTime = summary.categoricalColumns.find((column) => {
+    const header = column.header.toLowerCase();
+    return (/year|date|month|quarter/.test(header) || /年/.test(column.header)) && /year|date|month|quarter|年/.test(lowerPrompt);
+  });
+
+  if (explicitTime) return explicitTime;
+  return summary.categoricalColumns.find((column) => column.header === fallbackHeader || column.header === "Year" || column.time) || summary.categoricalColumns[0];
+}
+
+function buildMetricSeries(dataset, metricHeader, timeHeader) {
+  const summary = getColumnSummary(dataset);
+  const metricColumn = summary.numericColumns.find((column) => column.header === metricHeader) || getPreferredMetric(summary);
+  const timeColumn = summary.categoricalColumns.find((column) => column.header === timeHeader) || summary.categoricalColumns.find((column) => column.header === "Year" || column.time) || summary.categoricalColumns[0];
+
+  if (!metricColumn || !timeColumn) return [];
+
+  const metricIndex = dataset.headers.indexOf(metricColumn.header);
+  const timeIndex = dataset.headers.indexOf(timeColumn.header);
+
+  return dataset.rows
+    .map((row, index) => {
+      const year = Number(row[timeIndex] || index + 1);
+      const value = Number(row[metricIndex] || 0);
+      if (!Number.isFinite(year) || !Number.isFinite(value)) {
+        return null;
+      }
+
+      return { year, value };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.year - b.year);
+}
+
 function generateAnswer(dataset, prompt) {
   if (!dataset.headers.length || !dataset.rows.length) {
     return "Please upload a CSV file before asking analysis questions.";
@@ -642,6 +739,69 @@ function generateAnswer(dataset, prompt) {
 
   const analysis = getBusinessAnalysis(dataset);
   const lowerPrompt = prompt.toLowerCase();
+  const promptMetric = findMetricColumnByPrompt(dataset, prompt, analysis?.metricHeader);
+  const promptTime = getTimeColumnForPrompt(dataset, prompt, analysis?.timeHeader);
+  const promptSeries = buildMetricSeries(dataset, promptMetric.header, promptTime?.header);
+
+  if (promptSeries.length) {
+    const peak = promptSeries.reduce((best, current) => (current.value > best.value ? current : best), promptSeries[0]);
+    const trough = promptSeries.reduce((worst, current) => (current.value < worst.value ? current : worst), promptSeries[0]);
+    const latest = promptSeries[promptSeries.length - 1];
+
+    const asksPeak = /(最高|最多|最大|peak|top|max|biggest|largest|哪一年)/i.test(prompt);
+    const asksTrough = /(最低|最少|最小|min|bottom|smallest|lowest|哪一年最低)/i.test(prompt);
+    const asksGrowth = /(成長|復甦|rebound|recover|growth|increase|上升|走勢)/i.test(prompt);
+    const asksMarket = /(市場|國家|國籍|source|來源)/i.test(prompt);
+    const asksTrend = /(趨勢|trend|pattern)/i.test(prompt);
+    const asksAction = /(建議|recommend|action|方案)/i.test(prompt);
+    const asksForecast = /(預測|forecast|predict)/i.test(prompt);
+    const asksAnomaly = /(異常|outlier|shock|collapse|異常值)/i.test(prompt);
+
+    if (asksPeak) {
+      return `${promptMetric.header} reached its highest point in ${peak.year} at ${formatCompactNumber(peak.value)}.`;
+    }
+
+    if (asksTrough) {
+      return `${promptMetric.header} reached its lowest point in ${trough.year} at ${formatCompactNumber(trough.value)}.`;
+    }
+
+    if (asksGrowth) {
+      const latestVsFirst = ((latest.value - promptSeries[0].value) / Math.max(promptSeries[0].value, 1)) * 100;
+      return `${promptMetric.header} shows a ${formatNumber(Math.abs(latestVsFirst), 1)}% change from ${promptSeries[0].year} to ${latest.year}, indicating the overall business direction over the observed period.`;
+    }
+
+    if (asksMarket) {
+      const marketColumns = dataset.headers
+        .filter((header) => /^國籍_/.test(header))
+        .map((header) => ({
+          header,
+          total: dataset.rows.reduce((sum, row) => sum + Number(row[dataset.headers.indexOf(header)] || 0), 0),
+        }))
+        .sort((a, b) => b.total - a.total);
+
+      const topMarket = marketColumns[0];
+      return `The leading source market is ${topMarket.header.replace(/^國籍_/, "")} with a total contribution of ${formatCompactNumber(topMarket.total)}.`;
+    }
+
+    if (asksForecast) {
+      if (analysis?.forecast) {
+        return `The current linear trend implies a forecast of ${formatCompactNumber(analysis.forecast.value)} in ${analysis.forecast.year}, which is ${formatNumber(Math.abs(analysis.forecast.changePct), 1)}% ${analysis.forecast.changePct >= 0 ? "above" : "below"} the latest observation.`;
+      }
+    }
+
+    if (asksAction) {
+      return `Action recommendation: focus the next campaign on the strongest market segment and keep recovery buffers ready around low-demand periods.`;
+    }
+
+    if (asksAnomaly) {
+      const dropPct = ((peak.value - trough.value) / Math.max(peak.value, 1)) * 100;
+      return `The most visible anomaly is the swing from ${peak.year} to ${trough.year}: ${promptMetric.header} dropped by ${formatNumber(Math.abs(dropPct), 1)}%.`;
+    }
+
+    if (asksTrend) {
+      return `${promptMetric.header} shows a clear time-based shift: it peaked in ${peak.year}, declined to ${trough.year}, and ended at ${formatCompactNumber(latest.value)} in ${latest.year}.`;
+    }
+  }
 
   if (analysis) {
     if (lowerPrompt.includes("forecast") || lowerPrompt.includes("predict") || lowerPrompt.includes("預測")) {
@@ -684,7 +844,7 @@ function loadDataset(dataset) {
   state.rows = dataset.rows;
 
   renderSummary(state);
-  fillSelectors(state);
+  fillSelectors(state, true);
   renderDashboard(state);
   renderInsights(state);
   elements.aiResponse.textContent = `Dashboard refreshed. ${state.rows.length} rows loaded and ${state.headers.length} columns detected.`;
@@ -750,9 +910,13 @@ function handleFileUpload(event) {
 
 function wireEvents() {
   elements.fileInput.addEventListener("change", handleFileUpload);
-  elements.metricSelect.addEventListener("change", () => loadDataset(state));
-  elements.dimensionSelect.addEventListener("change", () => loadDataset(state));
-  elements.viewSelect.addEventListener("change", () => loadDataset(state));
+  elements.metricSelect.addEventListener("change", () => renderDashboard(state));
+  elements.dimensionSelect.addEventListener("change", () => renderDashboard(state));
+  elements.viewSelect.addEventListener("change", () => renderDashboard(state));
+
+  elements.presetButtons.forEach((button) => {
+    button.addEventListener("click", () => applyPreset(button.dataset.preset));
+  });
 
   elements.analyzeBtn.addEventListener("click", () => {
     const prompt = elements.askInput.value.trim();
